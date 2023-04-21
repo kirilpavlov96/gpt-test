@@ -1,0 +1,420 @@
+<?php
+
+namespace App\Repository;
+
+use App\Interfaces\AuditableInterface;
+use App\Service\OrderService;
+use DoubleBreak\RestTools\Helper;
+use DoubleBreak\RestTools\Repository;
+
+/**
+ * Class ProductRepository
+ * @package App\Repository
+ */
+class ProductRepository extends Repository\AbstractAdvancedQueryRepository implements AuditableInterface
+{
+    protected $entityName = 'App\\Entity\\ProductEntity';
+
+    use RepositoryAuditLogTrait;
+
+    /**
+     * Database table name
+     * @var string
+     */
+    protected string $tableName = 'product';
+
+    const FILE_MAX_LIMIT = 20000;
+
+    protected function getAliasColumnNames(): array
+    {
+        return [
+            'in_stock',
+            'reserved',
+            'incoming',
+        ];
+    }
+
+    protected function prepareCustomParameters($args): array
+    {
+        $result = $args;
+        foreach ($args as $column => $value) {
+            if ($column == 'search') {
+                foreach ($value as $key => $searchValue) {
+                    if ($key == 'name') {
+                        $result['disjunctionGroups'][] = [
+                            'columns' => ['skus', 'ean', 'internal_id', 'name'],
+                            'value' => $searchValue
+                        ];
+                        unset($result[$column][$key]);
+                        break;
+                    }
+                }
+            }
+
+            if ($column == 'suppliers') {
+                $columns = [];
+                $values = [];
+
+                if (is_array($value)) {
+                    foreach ($value as $searchValue) {
+                        $columns[] = 'suppliers';
+                        $values[] = $searchValue;
+                    }
+
+                    $result['disjunctionGroups'][] = [
+                        'columns' => $columns,
+                        'values' => $values
+                    ];
+                } else {
+                    $result['disjunctionGroups'][] = [
+                        'columns' => ['suppliers'],
+                        'value' => $value
+                    ];
+                }
+
+                unset($result[$column]);
+            }
+        }
+        return $result;
+    }
+
+    protected function getQuery($withBundleComponents = false, $queryComponents = []): string
+    {
+        return "SELECT * FROM (" . $this->getQueryInternal($withBundleComponents, $queryComponents) . ") CUSTOM ";
+    }
+
+    protected function getCountQuery($queryComponents = []): string
+    {
+        return "SELECT count(*) as `totalCount` FROM (" . $this->getQueryInternal(false, $queryComponents, true) . ") CUSTOM ";
+    }
+
+    public const FILTER_TO_SUB_SELECT = [
+        'in_stock' => "SUM(CASE WHEN w.read_only = false THEN ist.units END) as 'in_stock',",
+        'reserved' => "SUM(ist.reserved_units) as 'reserved',",
+        'incoming' => "SUM(ist.incoming_units) as 'incoming',",
+        'total_bundle_items_quantity' => "(SELECT SUM(bi.quantity) FROM bundle_item bi WHERE bi.product_uuid = p.uuid) as 'total_bundle_items_quantity',",
+        'variant_items_count' => "(SELECT count(pvi.item_uuid) FROM product_variant_item pvi WHERE  p.uuid = pvi.product_uuid) as 'variant_items_count',",
+        'suppliers' => "(SELECT GROUP_CONCAT(ps.supplier_uuid) FROM product_supplier ps WHERE ps.product_uuid = p.uuid) as 'suppliers',",
+        'suppliers_names' => "(SELECT GROUP_CONCAT(s.name) FROM product_supplier ps LEFT JOIN supplier s on ps.supplier_uuid = s.uuid WHERE ps.product_uuid = p.uuid) as 'suppliers_names',",
+        'skus' => "(
+                       SELECT JSON_ARRAYAGG(JSON_OBJECT('value', s.value, 'relatedOffer', s.related_offer, 'country', s.country))
+                       FROM item_sku its
+                                LEFT JOIN sku s ON s.value = its.sku_value
+                       WHERE its.item_uuid = p.item_uuid
+                   ) as 'skus',",
+        'warehouses' => "IF(GROUP_CONCAT(ist.warehouse_uuid) IS NOT null, JSON_ARRAYAGG(
+                           JSON_OBJECT(
+                                   'uuid', ist.warehouse_uuid,
+                                   'itemsCount', ist.units,
+                                   'avgPrice', ist.avg_delivery_price_system,
+                                   'name', w.name,
+                                   'readOnly', w.`read_only` = 1)
+                       ), '[]') as 'warehouses'",
+
+    ];
+
+    protected function getQueryInternal($withBundleComponents = false, $queryComponents = [], $forCountQuery = false): string
+    {
+        $params = $queryComponents['parameters'] ?? [];
+        $aggregateExpressions = $this->getAggregateExpressions($params, $forCountQuery);
+        $components = '';
+        if ($withBundleComponents) {
+            $components = ",
+         (SELECT GROUP_CONCAT(CONCAT(i.internal_id, ',', bi.quantity) SEPARATOR ';')
+              FROM bundle_item bi
+                       LEFT JOIN product pr on bi.simple_product_uuid = pr.uuid
+                       LEFT JOIN product_variant_item pvi on bi.variant_item_uuid = pvi.uuid
+                       LEFT JOIN item i on pr.item_uuid = i.uuid OR pvi.item_uuid = i.uuid
+              WHERE bi.product_uuid = p.uuid) as bundle_components";
+        }
+
+        return "
+            SELECT p.*,
+                   i.internal_id,
+                   i.ean,
+                   i.upc,
+                   i.weight,
+                   i.length,
+                   i.height,
+                   i.width,
+                   i.demand,
+                   i.avg_price_original,
+                   i.avg_price_preferred,
+                   i.avg_price_system,
+                   i.previous_avg_price_original,
+                   i.previous_avg_price_preferred,
+                   i.previous_avg_price_system $aggregateExpressions $components
+            FROM product p
+                     LEFT JOIN item i on p.item_uuid = i.uuid
+                     LEFT JOIN item_stock ist ON p.item_uuid = ist.item_uuid
+                     LEFT JOIN warehouse w on ist.warehouse_uuid = w.uuid
+            GROUP BY p.uuid
+        ";
+    }
+
+    /**
+     * @param $paramFilters
+     * @param $forCountQuery
+     * @return string
+     *
+     * For the count query we need to determine which params are passed
+     * in order to add only specific aggregate expression to the query.
+     * For example - If the following prepared params are passed to the query,
+     * we need to extract the unique filter's names,
+     * which we have available aggregate expressions for.
+     *
+     * $paramFilters = [
+     *      ':suppliers0' => '%d13e0218-92fa-4bd1-ae8f-053bd671b4b8%',
+     *      ':kind0' => 'SIMPLE',
+     *      ':kind1' => 'BUNDLE'
+     * ];
+     *
+     * $filters = [ supplier_uuids, custom_performed_actions]
+     */
+    protected function getAggregateExpressions($paramFilters, $forCountQuery)
+    {
+        $filters = array_keys(self::FILTER_TO_SUB_SELECT);
+        if ($forCountQuery) {
+            $passedFilter = [];
+            foreach ($paramFilters as $parameter => $value) {
+                foreach ($filters as $filter) {
+                    if (strpos($parameter, $filter) !== false) {
+                        $passedFilter[] = $filter;
+                    }
+                }
+            }
+            $filters = array_unique($passedFilter);
+        }
+
+        return $this->addAggregatedSubQueriesByFilters($filters);
+    }
+
+    protected function addAggregatedSubQueriesByFilters($passedFilters)
+    {
+        $subQueries = [];
+        foreach ($passedFilters as $filter) {
+            $subQuery = $this->getSubSelectByFilter($filter);
+            if (!empty($subQuery)) {
+                $subQueries[] = $subQuery;
+            }
+        }
+        $result = trim(implode(PHP_EOL, $subQueries), ',');
+        if (!empty($result)) {
+            return ',' . PHP_EOL . $result;
+        }
+        return '';
+    }
+
+    function getSubSelectByFilter($filter)
+    {
+        return self::FILTER_TO_SUB_SELECT[$filter] ?? '';
+    }
+
+    public function saveProductRelatedEntities(
+        $productToSave,
+        $skusToSave,
+        $mappingToSave
+    ) {
+        if (sizeof($productToSave) > 0) {
+            $this->insertIgnore($productToSave, 'product');
+        }
+        if (sizeof($skusToSave) > 0) {
+            $this->insertIgnore($skusToSave, 'sku');
+        }
+        if (sizeof($mappingToSave) > 0) {
+            $this->insertIgnore($mappingToSave, 'product_sku');
+        }
+    }
+
+    /**
+     * @param $entitiesToSave
+     * @param $tableName
+     */
+    private function insertIgnore($entitiesToSave, $tableName): void
+    {
+        $arrayKeys = array_map(
+            function ($key) {
+                return Helper::camelCaseToUnderscore($key);
+            },
+            array_keys($entitiesToSave[0])
+        );
+        $columnNames = '(`' . implode('` , `', $arrayKeys) . '`)';
+        $params = [];
+        $valuesPlaceholderArr = [];
+        $idx = 0;
+        foreach ($entitiesToSave as $entity) {
+            $idx++;
+            $placeHolderArr = [];
+            foreach ($entity as $key => $value) {
+                $placeHolder = $key . $idx;
+                $placeHolderArr[] = ':' . $placeHolder;
+                $params[$placeHolder] = $value;
+            }
+            $valuesPlaceholderArr[] = '(' . implode(',', $placeHolderArr) . ')';
+        }
+        $valuesPlaceholder = implode(',', $valuesPlaceholderArr);
+        $sql = "INSERT IGNORE INTO $tableName $columnNames VALUES $valuesPlaceholder";
+        $this->driver->execute($sql, $params);
+    }
+
+    public function getEntitiesBySaveIndex(string $tableName, string $column, string $saveIndex)
+    {
+        $sql = "SELECT $column FROM $tableName WHERE `save_index` = :index";
+        return $this->driver->fetchAll($sql, ['index' => $saveIndex]);
+    }
+
+    public function findProductUuidByItemInternalId(string $internalId)
+    {
+        $sql = "
+                SELECT p.uuid as 'uuid',
+                       i.uuid as 'item_uuid'
+                FROM product p
+                LEFT JOIN item i ON p.item_uuid = i.uuid
+                WHERE i.internal_id = :internalId
+        ";
+
+        return $this->driver->fetchOne($sql, ['internalId' => $internalId]);
+    }
+
+    public function findAllSkusByProductUuid(string $uuid)
+    {
+        $sql = "
+                SELECT DISTINCT isk.sku_value as 'value'
+                FROM product p
+                LEFT JOIN item i ON p.item_uuid = i.uuid
+                LEFT JOIN item_sku isk ON isk.item_uuid = i.uuid
+                WHERE p.uuid = :uuid
+        ";
+
+        return $this->driver->fetchAll($sql, ['uuid' => $uuid]);
+    }
+
+    public function findProductsBySku($sku)
+    {
+        $sql = "SELECT p.*, ANY_VALUE(s.name) as 'sku_name'
+                FROM product AS p
+                         LEFT JOIN product_sku AS ps ON ps.product_uuid = p.uuid
+                         LEFT JOIN sku s on ps.sku_value = s.value
+                WHERE s.value like :skuValue
+                GROUP BY ps.product_uuid";
+        return $this->driver->fetchAll($sql, ['skuValue' => $sku]);
+    }
+
+    public function generateStockAvailabilityForSimpleProduct($productUuid)
+    {
+        $sql = "
+            SELECT w.name                                                               as 'warehouse_name',
+                   SUM(IFNULL(ist.units, 0))                                            as 'in_stock',
+                   SUM(IFNULL(ist.reserved_units, 0))                                   as 'reserved',
+                   IFNULL(ist.incoming_units, 0)                                        as 'incoming',
+                   IFNULL(ROUND(AVG(ist.avg_delivery_price_original), 2), 0)            as 'avg_price_original',
+                   IFNULL(ROUND(AVG(ist.avg_delivery_price_preferred), 2), 0)           as 'avg_price_preferred',
+                   IFNULL(ROUND(AVG(ist.avg_delivery_price_system), 2), 0)              as 'avg_price_system',
+                   IFNULL(ROUND(AVG(ist.previous_avg_delivery_price_original), 2), 0)   as 'previous_avg_price_original',
+                   IFNULL(ROUND(AVG(ist.previous_avg_delivery_price_preferred), 2), 0)  as 'previous_avg_price_preferred',
+                   IFNULL(ROUND(AVG(ist.previous_avg_delivery_price_system), 2), 0)     as 'previous_avg_price_system'
+            FROM product p
+                     LEFT JOIN item i on p.item_uuid = i.uuid
+                     CROSS JOIN warehouse w
+                     LEFT JOIN item_stock ist on ist.item_uuid = p.item_uuid AND ist.warehouse_uuid = w.uuid
+            WHERE p.uuid = :uuid
+            GROUP BY p.uuid, w.uuid;
+        ";
+        return $this->driver->fetchAll($sql, ['uuid' => $productUuid]);
+    }
+
+    public function generateStockAvailabilityForBundle($productUuid)
+    {
+        $sql = "
+            SELECT w.name                                                                            as 'warehouse_name',
+                   MIN(FLOOR(IFNULL(ist.reserved_units / bi.quantity, 0)))                           as 'reserved',
+                   MIN(FLOOR(IFNULL(ist.units / bi.quantity, 0)))                                    as 'in_stock',
+                   MIN(FLOOR(IFNULL(ist.incoming_units / bi.quantity, 0)))                           as 'incoming',
+                   ROUND(SUM(IFNULL(ist.avg_delivery_price_original, 0) * bi.quantity), 2)           as 'avg_price_original',
+                   ROUND(SUM(IFNULL(ist.avg_delivery_price_preferred, 0) * bi.quantity), 2)          as 'avg_price_preferred',
+                   ROUND(SUM(IFNULL(ist.avg_delivery_price_system, 0) * bi.quantity), 2)             as 'avg_price_system',
+                   ROUND(SUM(IFNULL(ist.previous_avg_delivery_price_original, 0) * bi.quantity), 2)  as 'previous_avg_price_original',
+                   ROUND(SUM(IFNULL(ist.previous_avg_delivery_price_preferred, 0) * bi.quantity), 2) as 'previous_avg_price_preferred',
+                   ROUND(SUM(IFNULL(ist.previous_avg_delivery_price_system, 0) * bi.quantity), 2)    as 'previous_avg_price_system'
+            FROM bundle_item bi
+                     JOIN product bundle_product on bi.product_uuid = bundle_product.uuid
+                     LEFT JOIN product p on bi.simple_product_uuid = p.uuid
+                     LEFT JOIN product_variant_item pvi on bi.variant_item_uuid = pvi.uuid
+                     LEFT JOIN item i on p.item_uuid = i.uuid OR pvi.item_uuid = i.uuid
+                     CROSS JOIN warehouse w
+                     LEFT JOIN item_stock ist on ist.item_uuid = i.uuid AND ist.warehouse_uuid = w.uuid
+            WHERE bi.product_uuid = :uuid
+            GROUP BY bundle_product.uuid, w.uuid;
+        ";
+        return $this->driver->fetchAll($sql, ['uuid' => $productUuid]);
+    }
+
+
+    public function findBundlesContainingItem(array $itemUuids)
+    {
+        $sql = "
+            SELECT bundle_product.item_uuid
+            FROM bundle_item bi
+                     JOIN product bundle_product on bi.product_uuid = bundle_product.uuid
+                     LEFT JOIN product p on bi.simple_product_uuid = p.uuid
+                     LEFT JOIN product_variant_item pvi on bi.variant_item_uuid = pvi.uuid
+                     LEFT JOIN item i on p.item_uuid = i.uuid OR pvi.item_uuid = i.uuid
+            WHERE i.uuid IN ('" . implode("','", $itemUuids) . "')
+            GROUP BY bundle_product.item_uuid;
+        ";
+        return $this->driver->fetchAll($sql, []);
+    }
+
+    public function getProductListStatementWithBundleComponents(array $args)
+    {
+        $args = $this->prepareCustomParameters($args);
+        $queryComponents = $this->prepareQueryComponentsWithParameters($args);
+        $queryData = $this->getQueryWithParams($queryComponents, true);
+
+        $this->driver->execute($queryData['query'], $queryData['parameters']);
+        return $this->driver->getLastStatement();
+    }
+
+    protected function getQueryWithParams($queryComponents, $withBundleComponents = false): array
+    {
+        if (!isset($queryComponents['select'])) {
+            $query = $this->getQuery($withBundleComponents, $queryComponents);
+        } else {
+            $query = $queryComponents['select'];
+        }
+
+        $query .= ($queryComponents['where'] ?? '') . ($queryComponents['having'] ?? '') .
+            ($queryComponents['orderBy'] ?? '') . ($queryComponents['limit'] ?? '') .
+            ($queryComponents['offset'] ?? '');
+
+        return [
+            'query' => $query,
+            'parameters' => $queryComponents['parameters'] ?? []
+        ];
+    }
+
+    protected function getCountQueryWithParams($queryComponents): array
+    {
+        $query = $this->getCountQuery($queryComponents);
+        $query .= $queryComponents['whereNoPrefix'];
+        $having = $queryComponents['having'];
+        if (str_contains($having, 'HAVING')) {
+            if (str_contains($queryComponents['where'], 'WHERE')) {
+                $query .= ' AND ';
+            } else {
+                $query .= ' WHERE ';
+            }
+            $query .= substr($having, 6);
+        }
+
+        return [
+            'query' => $query,
+            'parameters' => $queryComponents['parameters']
+        ];
+    }
+
+    public function getLogIdentifierValue($data)
+    {
+        return $data['uuid'] ?? null;
+    }
+}
