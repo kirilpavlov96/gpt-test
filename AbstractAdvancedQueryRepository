@@ -1,0 +1,642 @@
+<?php
+
+namespace DoubleBreak\RestTools\Repository;
+
+
+use DoubleBreak\RestTools\Repository;
+
+abstract class AbstractAdvancedQueryRepository extends Repository
+{
+    const MAX_LIMIT = 100;
+
+    protected abstract function prepareCustomParameters($args): array;
+
+    protected abstract function getQuery(): string;
+
+    protected abstract function getCountQuery(): string;
+
+    /**
+     * Should be overriden when there are custom select components in the query with alias that have to be filtered
+     * with 'HAVING' clause.
+     *
+     * @return array
+     */
+    protected function getAliasColumnNames(): array
+    {
+        return [];
+    }
+
+    /**
+     * Should be overriden when there are multiple columns with the same name from joined tabled and you need prefix
+     * for them so that you don't receive 'column is ambitious' error.
+     * @return array
+     */
+    protected function getColumnToPrefixMap(): array
+    {
+        return [];
+    }
+
+    /**
+     * Find all with pagination.
+     * @param array $args
+     * @param int $maxLimit
+     * @return array
+     */
+    public function findAllWithPagination(
+        array $args = [],
+        int $maxLimit = self::MAX_LIMIT,
+        $withTotalCount = true
+    ): array {
+        $dataWithLastUpdated = $this->findAllWithPaginationInternal($args, $maxLimit);
+
+        if ($withTotalCount) {
+            $countQueryData = $this->getCountQueryWithParams($dataWithLastUpdated['queryComponents']);
+            $totalCountResult = $this->driver->fetchOne($countQueryData['query'], $countQueryData['parameters']);
+        }
+
+        return [
+            'data' => $dataWithLastUpdated['data'],
+            'page' => $dataWithLastUpdated['page'],
+            'limit' => $dataWithLastUpdated['limit'],
+            'totalCount' => isset($totalCountResult['totalCount']) ? (int)$totalCountResult['totalCount'] : 0
+        ];
+    }
+
+    public function findAllWithPaginationInternal($args = [], $maxLimit = self::MAX_LIMIT): array
+    {
+        $limitAndOffset = $this->getLimitAndOffset($args, $maxLimit);
+        $args['limit'] = $limitAndOffset['limit'];
+        $args['offset'] = $limitAndOffset['offset'];
+
+        $args = $this->prepareCustomParameters($args);
+        $queryComponents = $this->prepareQueryComponentsWithParameters($args);
+        $queryData = $this->getQueryWithParams($queryComponents);
+        $data = $this->driver->fetchAll($queryData['query'], $queryData['parameters']);
+
+        return [
+            'data' => $data,
+            'page' => $limitAndOffset['page'],
+            'limit' => $limitAndOffset['limit'],
+            'offset' => $limitAndOffset['offset'],
+            'queryComponents' => $queryComponents
+        ];
+    }
+
+    protected function prepareQueryComponentsWithParameters($arguments): array
+    {
+        $whereClause = [];
+        $whereClauseNoPrefix = [];
+        $havingClause = [];
+        $parameterValues = [];
+        $limit = '';
+        $offset = '';
+        $orderBy = '';
+        foreach ($arguments as $column => $value) {
+            switch ($column) {
+                case 'sort':
+                    $orderBy = $this->prepareSort($value, $orderBy);
+                    break;
+                case 'limit':
+                    $limit = ' LIMIT ' . (int)$value;
+                    break;
+                case 'offset':
+                    $offset = ' OFFSET ' . (int)$value;
+                    break;
+                case 'search':
+                    $this->prepareSearch($value, $whereClause, $whereClauseNoPrefix, $havingClause, $parameterValues);
+                    break;
+                case 'filterDate':
+                    $this->prepareDateFilter($value, $whereClause, $whereClauseNoPrefix, $parameterValues);
+                    break;
+                case 'disjunctionGroups':
+                    $this->prepareDisjunctionGroups(
+                        $value,
+                        $parameterValues,
+                        $whereClause,
+                        $whereClauseNoPrefix,
+                        $havingClause
+                    );
+                    break;
+                case 'disjunctionJSONSearchGroup':
+                    $this->prepareDisjunctionJsonGroup(
+                        $value,
+                        $parameterValues,
+                        $whereClause,
+                        $whereClauseNoPrefix,
+                        $havingClause
+                    );
+                    break;
+                case 'unificationGroups':
+                    $this->prepareUnificationGroup(
+                        $value,
+                        $parameterValues,
+                        $whereClause,
+                        $whereClauseNoPrefix,
+                        $havingClause
+                    );
+                    break;
+                case 'jsonLength':
+                    $this->prepareJsonLength($value, $whereClause, $whereClauseNoPrefix, $parameterValues);
+                    break;
+                case 'filterRange':
+                    $this->prepareFilterRange(
+                        $value,
+                        $whereClause,
+                        $whereClauseNoPrefix,
+                        $parameterValues,
+                        $havingClause
+                    );
+                    break;
+                case 'custom':
+                    $this->prepareCustom(
+                        $value,
+                        $whereClause,
+                        $whereClauseNoPrefix,
+                        $parameterValues,
+                        $havingClause
+                    );
+                    break;
+                default:
+                    $this->prepareFilter(
+                        $column,
+                        $value,
+                        $parameterValues,
+                        $whereClause,
+                        $whereClauseNoPrefix,
+                        $havingClause
+                    );
+                    break;
+            }
+        }
+        $where = $this->implodeClause('WHERE', $whereClause);
+        $whereNoPrefix = $this->implodeClause('WHERE', $whereClauseNoPrefix);
+        $having = $this->implodeClause('HAVING', $havingClause);
+
+        return [
+            'where' => $where,
+            'whereNoPrefix' => $whereNoPrefix,
+            'having' => $having,
+            'limit' => $limit,
+            'offset' => $offset,
+            'orderBy' => $orderBy,
+            'parameters' => $parameterValues
+        ];
+    }
+
+    /**
+     * @param $key
+     * @param string $placeHolder
+     * @return string
+     */
+    protected function createLikeClause($key, string $placeHolder, $not = false): string
+    {
+        $string = $this->getColumnToPrefixMap()[$key] ?? '';
+        return $string . '`' . $this->sanitizeString($key) . '`' . ($not ? ' NOT' : '') . ' LIKE ' . $placeHolder;
+    }
+
+    /**
+     * @param $key
+     * @param string $placeHolder
+     * @return string
+     */
+    protected function createJSONSearchClause($key, string $placeHolder, $not = false): string
+    {
+        return "JSON_SEARCH(`" . $this->sanitizeString($key) . "`, 'all', $placeHolder) IS NOT NULL";
+    }
+
+    /**
+     * @param $args
+     * @param $maxLimit
+     * @return array
+     */
+    protected function getLimitAndOffset($args, $maxLimit): array
+    {
+        $page = (int)($args['offset'] ?? 1);
+        if ($page < 1) {
+            $page = 1;
+        }
+        $limit = isset($args['limit']) ? ($args['limit'] <= $maxLimit ? (int)$args['limit'] : $maxLimit) : $maxLimit;
+        $offset = ($page - 1) * $limit;
+
+        $result['limit'] = $limit;
+        $result['offset'] = $offset;
+        $result['page'] = $page;
+
+        return $result;
+    }
+
+    protected function getCountQueryWithParams($queryComponents): array
+    {
+        $query = $this->getCountQuery();
+        $query .= $queryComponents['whereNoPrefix'];
+        $having = $queryComponents['having'];
+        if (str_contains($having, 'HAVING')) {
+            if (str_contains($queryComponents['where'], 'WHERE')) {
+                $query .= ' AND ';
+            } else {
+                $query .= ' WHERE ';
+            }
+            $query .= substr($having, 6);
+        }
+
+        return [
+            'query' => $query,
+            'parameters' => $queryComponents['parameters']
+        ];
+    }
+
+    protected function getQueryWithParams($queryComponents): array
+    {
+        if (!isset($queryComponents['select'])) {
+            $query = $this->getQuery();
+        } else {
+            $query = $queryComponents['select'];
+        }
+
+        $query .= ($queryComponents['where'] ?? '') . ($queryComponents['having'] ?? '') . ($queryComponents['orderBy'] ?? '') . ($queryComponents['limit'] ?? '') . ($queryComponents['offset'] ?? '');
+
+        return [
+            'query' => $query,
+            'parameters' => $queryComponents['parameters'] ?? []
+        ];
+    }
+
+    /**
+     * @param $value
+     * @param string $orderBy
+     * @return string
+     */
+    protected function prepareSort($value, string $orderBy): string
+    {
+        foreach ($value as $columnSort => $direction) {
+            if (in_array($direction, self::SORT_DIRECTIONS)) {
+                $orderByClauses[] = ($this->getColumnToPrefixMap()[$columnSort] ?? '') . '`' . $this->sanitizeString(
+                        $columnSort
+                    ) . '` ' . $this->sanitizeString($direction);
+            }
+        }
+        if (!empty($orderByClauses)) {
+            $orderBy = ' ORDER BY ' . implode(',', $orderByClauses);
+        }
+        return $orderBy;
+    }
+
+    /**
+     * @param $value
+     * @param array $whereClause
+     * @param array $parameterValues
+     * @return array
+     */
+    protected function prepareSearch(
+        $value,
+        array &$whereClause,
+        array &$whereClauseNoPrefix,
+        array &$havingClause,
+        array &$parameterValues
+    ): void {
+        foreach ($value as $key => $searchValue) {
+            $placeHolder = ':' . $key;
+            if (in_array($key, $this->getAliasColumnNames())) {
+                $havingClause[] = $this->createLikeClause($key, $placeHolder);
+            } else {
+                $where = $this->createLikeClause($key, $placeHolder);
+                $whereClause[] = $where;
+                $whereClauseNoPrefix[] = $where;
+            }
+            $parameterValues[$placeHolder] = '%' . trim($searchValue, " \t\n\r\0\x0B,") . '%';
+        }
+    }
+
+    /**
+     * @param $value
+     * @param $whereClause
+     * @param $parameterValues
+     * @return array
+     */
+    protected function prepareDateFilter($value, &$whereClause, &$whereClauseNoPrefix, &$parameterValues): void
+    {
+        foreach ($value as $columnDate => $filterDateValue) {
+            $columnDateSanitized = $this->sanitizeString($columnDate);
+            $prefix = ($this->getColumnToPrefixMap()[$columnDateSanitized] ?? '');
+            $placeHolderFrom = ':from_' . $columnDateSanitized;
+            $placeHolderTo = ':to_' . $columnDateSanitized;
+            if (!isset($filterDateValue['from']) || !isset($filterDateValue['to'])) {
+                continue;
+            }
+            $whereClause[] = $prefix . $columnDateSanitized . ' between ' . $placeHolderFrom . ' AND ' . $placeHolderTo;
+            $whereClauseNoPrefix[] = $columnDateSanitized . ' between ' . $placeHolderFrom . ' AND ' . $placeHolderTo;
+            $parameterValues[$placeHolderFrom] = trim($filterDateValue['from'], " \t\n\r\0\x0B,");
+            $parameterValues[$placeHolderTo] = trim($filterDateValue['to'], " \t\n\r\0\x0B,");
+        }
+    }
+
+    protected function prepareRangeParameterValuesAndCondition(
+        &$parameterValues,
+        &$condition,
+        $operator,
+        $number,
+        $column,
+        $suffix = ''
+    ) {
+        $columnSanitized = $this->sanitizeString($column);
+        $placeHolder = ':' . $columnSanitized . $suffix;
+
+        if (!empty($condition)) {
+            $condition .= ' AND ';
+        }
+
+        if ($number === 'null') {
+            $condition .= '`' . $columnSanitized . '` IS NULL';
+        } else {
+            $condition .= '`' . $columnSanitized . '` ' . $operator . ' ' . $placeHolder;
+            $parameterValues[$placeHolder] = trim($number, " \t\n\r\0\x0B,");
+        }
+    }
+
+    protected function prepareFilterRange(
+        $value,
+        &$whereClause,
+        &$whereClauseNoPrefix,
+        &$parameterValues,
+        &$havingClause
+    ): void {
+        foreach ($value as $column => $range) {
+            if (!is_array($range)) {
+                continue;
+            }
+
+            $condition = '';
+
+            $leftOperator = $range[0] ?? '';
+            $leftNumber = $range[1] ?? '';
+            $rightOperator = $range[2] ?? '';
+            $rightNumber = $range[3] ?? '';
+
+            if (!empty($leftOperator) && $leftOperator === '=') {
+                $this->prepareRangeParameterValuesAndCondition(
+                    $parameterValues,
+                    $condition,
+                    $leftOperator,
+                    $leftNumber,
+                    $column
+                );
+            } elseif (!empty($rightOperator) && $rightOperator === '=') {
+                $this->prepareRangeParameterValuesAndCondition(
+                    $parameterValues,
+                    $condition,
+                    $rightOperator,
+                    $rightNumber,
+                    $column
+                );
+            } else {
+                if (!empty($leftOperator) && in_array($leftOperator, ['>=', '>']
+                    ) && ($leftNumber === 0 || $leftNumber === '0' || !empty($leftNumber))) {
+                    $this->prepareRangeParameterValuesAndCondition(
+                        $parameterValues,
+                        $condition,
+                        $leftOperator,
+                        $leftNumber,
+                        $column,
+                        'left'
+                    );
+                }
+
+                if (!empty($rightOperator) && in_array($rightOperator, ['<=', '<']
+                    ) && ($rightNumber === 0 || $rightNumber === '0' || !empty($rightNumber))) {
+                    $this->prepareRangeParameterValuesAndCondition(
+                        $parameterValues,
+                        $condition,
+                        $rightOperator,
+                        $rightNumber,
+                        $column,
+                        'right'
+                    );
+                }
+            }
+
+            if (in_array($column, $this->getAliasColumnNames())) {
+                $havingClause[] = $condition;
+            } else {
+                $whereClause[] = ($this->getColumnToPrefixMap()[$column] ?? '') . $condition;
+                $whereClauseNoPrefix[] = $condition;
+            }
+        }
+    }
+
+    /**
+     * @param $value
+     * @param $parameterValues
+     * @param $whereClause
+     * @return array
+     */
+    protected function prepareDisjunctionGroups(
+        $value,
+        &$parameterValues,
+        &$whereClause,
+        &$whereClauseNoPrefix,
+        &$havingClause
+    ): void {
+        foreach ($value as $disjunctionGroup) {
+            $customWhereClause = [];
+            $customHavingClause = [];
+            foreach ($disjunctionGroup['columns'] as $key => $subColumn) {
+                $columnSanitized = ':' . $this->sanitizeString($subColumn) . $key;
+                $customClause = $this->createLikeClause($subColumn, $columnSanitized);
+                if (in_array($subColumn, $this->getAliasColumnNames())) {
+                    $customHavingClause[] = $customClause;
+                } else {
+                    $customWhereClause[] = $customClause;
+                }
+                $internalValue = isset($disjunctionGroup['values']) && is_array(
+                    $disjunctionGroup['values']
+                ) ? $disjunctionGroup['values'][$key] : $disjunctionGroup['value'];
+                $parameterValues[$columnSanitized] = '%' . trim(
+                        $internalValue,
+                        " \t\n\r\0\x0B,"
+                    ) . '%';
+            }
+            if (!empty($customWhereClause)) {
+                $where = '( ' . implode(' OR ', $customWhereClause) . ' )';
+                $whereClause[] = $where;
+                $whereClauseNoPrefix[] = $where;
+            }
+            if (!empty($customHavingClause)) {
+                $havingClause[] = '( ' . implode(' OR ', $customHavingClause) . ' )';
+            }
+        }
+    }
+
+    /**
+     * @param $value
+     * @param $parameterValues
+     * @param $whereClause
+     * @return array
+     */
+    protected function prepareDisjunctionJsonGroup(
+        $value,
+        &$parameterValues,
+        &$whereClause,
+        &$whereClauseNoPrefix,
+        &$havingClause
+    ): void {
+        foreach ($value as $disjunctionJSONGroup) {
+            $customWhereClause = [];
+            $customHavingClause = [];
+            $column = $disjunctionJSONGroup['column'];
+            foreach ($disjunctionJSONGroup['values'] as $key => $value) {
+                $columnSanitized = ':' . $this->sanitizeString($column) . $key;
+                $customClause = $this->createJSONSearchClause($column, $columnSanitized);
+                if (in_array($column, $this->getAliasColumnNames())) {
+                    $customHavingClause[] = $customClause;
+                } else {
+                    $customWhereClause[] = $customClause;
+                }
+                $parameterValues[$columnSanitized] = trim($value, " \t\n\r\0\x0B,");
+            }
+            if (!empty($customWhereClause)) {
+                $where = '( ' . implode(' OR ', $customWhereClause) . ' )';
+                $whereClause[] = $where;
+                $whereClauseNoPrefix[] = $where;
+            }
+            if (!empty($customHavingClause)) {
+                $havingClause[] = '( ' . implode(' OR ', $customHavingClause) . ' )';
+            }
+        }
+    }
+
+    /**
+     * @param $value
+     * @param $parameterValues
+     * @param $whereClause
+     * @return array
+     */
+    protected function prepareUnificationGroup(
+        $value,
+        &$parameterValues,
+        &$whereClause,
+        &$whereClauseNoPrefix,
+        &$havingClause
+    ): void {
+        foreach ($value as $unificationGroup) {
+            $operator = $unificationGroup['operator'] ?? 'AND';
+            $customWhereClause = [];
+            $customHavingClause = [];
+            $idx = 0;
+            foreach ($unificationGroup['values'] as $param) {
+                $columnSanitized = ':' . $this->sanitizeString(
+                        $unificationGroup['column']
+                    ) . '_ug' . $idx++;
+
+                $not = false;
+                if ($param[0] == '!') {
+                    $not = true;
+                    $param = substr($param, 1);
+                }
+                $customClause = $this->createLikeClause($unificationGroup['column'], $columnSanitized, $not);
+                if (in_array($unificationGroup['column'], $this->getAliasColumnNames())) {
+                    $customHavingClause[] = $customClause;
+                } else {
+                    $customWhereClause[] = $customClause;
+                }
+                $parameterValues[$columnSanitized] = '%' . trim($param, " \t\n\r\0\x0B,") . '%';
+            }
+            if (!empty($customWhereClause)) {
+                $where = '( ' . implode(" $operator ", $customWhereClause) . ' )';
+                $whereClause[] = $where;
+                $whereClauseNoPrefix[] = $where;
+            }
+            if (!empty($customHavingClause)) {
+                $havingClause[] = '( ' . implode(" $operator ", $customHavingClause) . ' )';
+            }
+        }
+    }
+
+    /**
+     * @param $value
+     * @param $whereClause
+     * @param $parameterValues
+     * @return array
+     */
+    protected function prepareJsonLength($value, &$whereClause, &$whereClauseNoPrefix, &$parameterValues): void
+    {
+        $columnSanitized = $this->sanitizeString($this->removeKeywords($value['field']));
+        $operationSanitized = $this->sanitizeString($this->removeKeywords($value['operation']));
+        $valueSanitized = $this->sanitizeString($this->removeKeywords($value['value']));
+
+        $where = 'JSON_LENGTH(`' . $columnSanitized . '`) ' . $operationSanitized . ' :json_length_val';
+        $whereClause[] = $where;
+        $whereClauseNoPrefix[] = $where;
+        $parameterValues[':json_length_val'] = trim($valueSanitized, " \t\n\r\0\x0B,");
+    }
+
+    /**
+     * @param $column
+     * @param $value
+     * @param array $parameterValues
+     * @param array $whereClause
+     * @return array
+     */
+    protected function prepareFilter(
+        $column,
+        $value,
+        array &$parameterValues,
+        array &$whereClause,
+        array &$whereClauseNoPrefix,
+        array &$havingClause
+    ): void {
+        $columnSanitized = $this->sanitizeString($column);
+        if (is_array($value)) {
+            $inClause = [];
+            foreach ($value as $index => $whereValue) {
+                $placeHolder = ':' . $columnSanitized . strtoupper($index);
+                $inClause[] = $placeHolder;
+                $parameterValues[$placeHolder] = trim($whereValue, " \t\n\r\0\x0B,");
+            }
+            $customClause = '`' . $columnSanitized . '` IN (' . implode(', ', $inClause) . ')';
+        } else {
+            $placeHolder = ':' . $columnSanitized;
+            $customClause = '`' . $columnSanitized . '`' . ' = ' . $placeHolder;
+            $parameterValues[$placeHolder] = trim($value, " \t\n\r\0\x0B,");
+        }
+        if (in_array($column, $this->getAliasColumnNames())) {
+            $havingClause[] = $customClause;
+        } else {
+            $whereClause[] = ($this->getColumnToPrefixMap()[$column] ?? '') . $customClause;
+            $whereClauseNoPrefix[] = $customClause;
+        }
+    }
+
+    /**
+     * @param $value
+     * @param $whereClause
+     * @param $whereClauseNoPrefix
+     * @param $parameterValues
+     * @return void
+     */
+    protected function prepareCustom($value, &$whereClause, &$whereClauseNoPrefix, &$parameterValues, &$having): void
+    {
+        foreach ($value as $singleValue) {
+            if (!empty($singleValue['where'])) {
+                $whereClause[] = $singleValue['where'];
+                $whereClauseNoPrefix[] = $singleValue['where'];
+            }
+            if (!empty($singleValue['having'])) {
+                $having[] = $singleValue['having'];
+            }
+            $parameterValues = array_merge($parameterValues, $singleValue['parameterValues'] ?? []);
+        }
+    }
+
+    /**
+     * @param array $clause
+     * @return string
+     */
+    protected function implodeClause($keyword, array $clause): string
+    {
+        $result = '';
+        if (!empty($clause)) {
+            $result = $keyword . ' ' . implode(' AND ', $clause);
+        }
+        return $result . ' ';
+    }
+}
